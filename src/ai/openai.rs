@@ -160,12 +160,26 @@ pub struct OpenAiUsage {
         skip_serializing_if = "Option::is_none"
     )]
     pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    /// Reasoning tokens, where the endpoint reports them.  Dropped like
+    /// prompt_tokens_details when it doesn't fit the documented shape.
+    #[serde(
+        default,
+        deserialize_with = "lenient_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct OpenAiPromptTokensDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct OpenAiCompletionTokensDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,9 +657,34 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         .filter(|&c| c <= resp.usage.prompt_tokens)
         .unwrap_or(0);
 
+    // OpenAI counts reasoning tokens in completion_tokens and reports
+    // reasoning_tokens as a breakdown of it.  Some compatible endpoints
+    // (Gemini's) report them beside completion_tokens instead, with
+    // total_tokens covering both.  Add them only when the total shows they
+    // are not counted yet, so that output is billed reasoning included
+    // either way.
+    let reasoning = resp
+        .usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|d| d.reasoning_tokens)
+        .unwrap_or(0);
+    let completion = if reasoning > 0
+        && resp
+            .usage
+            .prompt_tokens
+            .saturating_add(resp.usage.completion_tokens)
+            .saturating_add(reasoning)
+            <= resp.usage.total_tokens
+    {
+        resp.usage.completion_tokens + reasoning
+    } else {
+        resp.usage.completion_tokens
+    };
+
     let usage = Some(AiUsage {
         prompt_tokens: resp.usage.prompt_tokens as usize,
-        completion_tokens: resp.usage.completion_tokens as usize,
+        completion_tokens: completion as usize,
         total_tokens: resp.usage.total_tokens as usize,
         cached_tokens: if cached > 0 {
             Some(cached as usize)
@@ -1276,6 +1315,7 @@ mod tests {
                 completion_tokens: 20,
                 total_tokens: 30,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             },
             service_tier: None,
         };
@@ -1316,6 +1356,7 @@ mod tests {
                 prompt_tokens_details: Some(OpenAiPromptTokensDetails {
                     cached_tokens: Some(cached_tokens),
                 }),
+                completion_tokens_details: None,
             },
             service_tier: None,
         };
@@ -1335,6 +1376,50 @@ mod tests {
         let usage = translate_ai_response(make_resp(2048, 3000))?.usage.unwrap();
         assert_eq!(usage.cached_tokens, None);
         assert_eq!(usage.prompt_tokens, 2048);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_reasoning_token_handling() -> Result<()> {
+        let make_resp = |completion_tokens: u32, reasoning_tokens: u32, total_tokens: u32| {
+            OpenAiResponse {
+                choices: vec![OpenAiChoice {
+                    index: 0,
+                    message: OpenAiMessage {
+                        role: "assistant".to_string(),
+                        content: Some("Yes".to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        reasoning: None,
+                    },
+                    finish_reason: "stop".to_string(),
+                }],
+                usage: OpenAiUsage {
+                    prompt_tokens: 50,
+                    completion_tokens,
+                    total_tokens,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: Some(OpenAiCompletionTokensDetails {
+                        reasoning_tokens: Some(reasoning_tokens),
+                    }),
+                },
+                service_tier: None,
+            }
+        };
+
+        // Gemini's compatible API: reasoning beside completion_tokens, in the total.
+        let usage = translate_ai_response(make_resp(5, 763, 818))?.usage.unwrap();
+        assert_eq!(usage.completion_tokens, 768);
+
+        // OpenAI: reasoning already counted in completion_tokens.
+        let usage = translate_ai_response(make_resp(768, 763, 818))?.usage.unwrap();
+        assert_eq!(usage.completion_tokens, 768);
+
+        // No reasoning reported: completion_tokens unchanged.
+        let usage = translate_ai_response(make_resp(5, 0, 55))?.usage.unwrap();
+        assert_eq!(usage.completion_tokens, 5);
 
         Ok(())
     }
@@ -1413,6 +1498,7 @@ mod tests {
                 completion_tokens: 25,
                 total_tokens: 40,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             },
             service_tier: None,
         };
@@ -1440,6 +1526,7 @@ mod tests {
                 completion_tokens: 0,
                 total_tokens: 10,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             },
             service_tier: None,
         };
