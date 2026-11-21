@@ -95,6 +95,11 @@ pub struct OpenAiToolCall {
     #[serde(rename = "type")]
     pub tool_type: String,
     pub function: OpenAiToolCallFunction,
+    /// Vendor data on a tool call. Gemini's OpenAI-compatible API carries
+    /// the call's thought signature in `extra_content.google.thought_signature`
+    /// and rejects the next turn if it isn't sent back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -459,6 +464,9 @@ fn translate_ai_request(
                                     name: t.function_name,
                                     arguments: serde_json::to_string(&t.arguments).unwrap(),
                                 },
+                                extra_content: t.thought_signature.map(|sig| {
+                                    serde_json::json!({ "google": { "thought_signature": sig } })
+                                }),
                             })
                             .collect()
                     }),
@@ -597,11 +605,17 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
             .map(|t| {
                 let arguments: Value =
                     serde_json::from_str(&t.function.arguments).unwrap_or(serde_json::Value::Null);
+                let thought_signature = t
+                    .extra_content
+                    .as_ref()
+                    .and_then(|e| e.pointer("/google/thought_signature"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 ToolCall {
                     id: t.id,
                     function_name: t.function.name,
                     arguments,
-                    thought_signature: None,
+                    thought_signature,
                 }
             })
             .collect()
@@ -1386,6 +1400,7 @@ mod tests {
                             name: "my_tool".to_string(),
                             arguments: r#"{"arg":"val"}"#.to_string(),
                         },
+                        extra_content: None,
                     }]),
                     tool_call_id: None,
                     reasoning_content: None,
